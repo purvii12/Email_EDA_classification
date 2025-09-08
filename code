@@ -313,3 +313,10 @@ model.fit(X_spam, y_spam, epochs=10, batch_size=8, validation_split=0.2)
 # Evaluate final accuracy
 loss, accuracy = model.evaluate(X_spam, y_spam, verbose=0)
 print(f"\nFinal MLP model accuracy on first 50 emails from each mailbox: {accuracy:.2f}")
+
+
+plt.savefig('average-emails-per-hour.png', bbox_inches='tight')
+plt.savefig('email-count-by-day-of-week.png', bbox_inches='tight')
+plt.savefig('fractions-of-emails-by-day-of-week.png', bbox_inches='tight')
+
+
