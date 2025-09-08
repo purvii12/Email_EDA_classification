@@ -1,0 +1,315 @@
+# STEP 1: Install required packages
+!pip install mailbox wordcloud pytz
+
+# STEP 2: Import libraries
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import mailbox
+import re
+import pytz
+from matplotlib.ticker import MaxNLocator
+from scipy import ndimage
+from scipy.interpolate import interp1d
+import tensorflow as tf
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Input
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from wordcloud import WordCloud
+
+# STEP 3: Mount Google Drive and specify paths for Inbox and Sent mbox files
+from google.colab import drive
+drive.mount('/content/gdrive')
+
+inbox_file = '/content/gdrive/My Drive/nnml/takeout/Takeout/Mail/Inbox.mbox'
+sent_file = '/content/gdrive/My Drive/nnml/takeout/Takeout/Mail/Sent.mbox'
+
+# STEP 4: Load mailboxes
+mbox_inbox = mailbox.mbox(inbox_file)
+mbox_sent = mailbox.mbox(sent_file)
+
+# STEP 5: Extract email data from both mailboxes into lists
+def extract_mailbox_data(mbox, label_name):
+    data = []
+    for msg in mbox:
+        data.append({
+            'subject': msg['subject'],
+            'from': msg['from'],
+            'date': msg['date'],
+            'to': msg['to'],
+            'X-Gmail-Labels': msg['X-Gmail-Labels'] if 'X-Gmail-Labels' in msg else '',
+            'X-GM-THRID': msg['X-GM-THRID'],
+            'mailbox_label': label_name  # 'inbox' or 'sent'
+        })
+    return data
+
+inbox_data = extract_mailbox_data(mbox_inbox, 'inbox')
+sent_data = extract_mailbox_data(mbox_sent, 'sent')
+
+# STEP 6: Convert lists to DataFrames and concatenate
+dfs_inbox = pd.DataFrame(inbox_data)
+dfs_sent = pd.DataFrame(sent_data)
+dfs = pd.concat([dfs_inbox, dfs_sent], ignore_index=True)
+
+# STEP 7: Clean and preprocess the DataFrame
+
+# Fix column names
+dfs.rename(columns={'mailbox_label': 'mailbox'}, inplace=True)
+
+# Convert date to datetime (handle errors)
+dfs['date'] = pd.to_datetime(dfs['date'], errors='coerce', utc=True)
+dfs = dfs[dfs['date'].notna()].copy()
+dfs.reset_index(drop=True, inplace=True)
+
+# Extract email address from 'from' field
+def extract_email_ID(string):
+    email = re.findall(r'<(.+?)>', str(string))
+    if not email:
+        email = list(filter(lambda y: '@' in y, str(string).split()))
+    return email[0] if email else np.nan
+
+dfs['from'] = dfs['from'].apply(extract_email_ID)
+
+# Refactor timezone to US/Eastern
+def refactor_timezone(x):
+    est = pytz.timezone('US/Eastern')
+    return x.astimezone(est)
+
+dfs['date'] = dfs['date'].apply(refactor_timezone)
+
+# Add useful time features
+dfs['dayofweek'] = dfs['date'].apply(lambda x: x.day_name())
+dfs['dayofweek'] = pd.Categorical(
+    dfs['dayofweek'],
+    categories=['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+    ordered=True
+)
+dfs['timeofday'] = dfs['date'].apply(lambda x: x.hour + x.minute/60 + x.second/3600)
+dfs['hour'] = dfs['date'].apply(lambda x: x.hour)
+dfs['year_int'] = dfs['date'].apply(lambda x: x.year)
+dfs['year'] = dfs['date'].apply(lambda x: x.year + x.dayofyear/365.25)
+
+# Set date as index and drop original date column
+dfs.set_index('date', inplace=True)
+
+# STEP 8: Split back into inbox and sent DataFrames (for plotting etc.)
+sent = dfs[dfs['mailbox'] == 'sent'].copy()
+received = dfs[dfs['mailbox'] == 'inbox'].copy()
+
+# --- Plotting Functions ---
+
+def plot_todo_vs_year(df, ax, color='C0', s=0.5, title=''):
+    df.plot.scatter('year', 'timeofday', s=s, alpha=0.6, ax=ax, color=color)
+    ax.set_ylim(0, 24)
+    ax.yaxis.set_major_locator(MaxNLocator(8))
+    ax.set_yticklabels([pd.to_datetime(f"{int(np.mod(ts,24))}:00", format="%H:%M").strftime("%I %p") for ts in ax.get_yticks()])
+    ax.set_xlabel('')
+    ax.set_ylabel('')
+    ax.set_title(title)
+    ax.grid(ls=':', color='k')
+    return ax
+
+def plot_number_perday_per_year(df, ax, label=None, dt=0.3, **plot_kwargs):
+    year = df[df['year'].notna()]['year'].values
+    T = year.max() - year.min()
+    bins = max(1, int(T / dt))
+    weights = 1 / (np.ones_like(year) * dt * 365.25)
+    ax.hist(year, bins=bins, weights=weights, label=label, **plot_kwargs)
+    ax.grid(ls=':', color='k')
+
+def plot_number_perdhour_per_year(df, ax, label=None, dt=1, smooth=False,
+                                  weight_fun=None, **plot_kwargs):
+    tod = df[df['timeofday'].notna()]['timeofday'].values
+    year = df[df['year'].notna()]['year'].values
+    Ty = year.max() - year.min()
+    T = tod.max() - tod.min()
+    bins = int(T / dt)
+    if weight_fun is None:
+        weights = 1 / (np.ones_like(tod) * Ty * 365.25 / dt)
+    else:
+        weights = weight_fun(df)
+    if smooth:
+        hst, xedges = np.histogram(tod, bins=bins, weights=weights)
+        x = np.delete(xedges, -1) + 0.5*(xedges[1] - xedges[0])
+        hst = ndimage.gaussian_filter(hst, sigma=0.75)
+        f = interp1d(x, hst, kind='cubic')
+        xnew = np.linspace(x.min(), x.max(), 10000)
+        hst = f(xnew)
+        ax.plot(xnew, hst, label=label, **plot_kwargs)
+    else:
+        ax.hist(tod, bins=bins, weights=weights, label=label, **plot_kwargs)
+
+    ax.grid(ls=':', color='k')
+    orientation = plot_kwargs.get('orientation')
+    if orientation is None or orientation == 'vertical':
+        ax.set_xlim(0, 24)
+        ax.xaxis.set_major_locator(MaxNLocator(8))
+        ax.set_xticklabels([pd.to_datetime(f"{int(np.mod(ts,24))}:00", format="%H:%M").strftime("%I %p") for ts in ax.get_xticks()])
+    elif orientation == 'horizontal':
+        ax.set_ylim(0, 24)
+        ax.yaxis.set_major_locator(MaxNLocator(8))
+        ax.set_yticklabels([pd.to_datetime(f"{int(np.mod(ts,24))}:00", format="%H:%M").strftime("%I %p") for ts in ax.get_yticks()])
+
+# TriplePlot class for combined plots
+class TriplePlot:
+    def __init__(self):
+        gs = gridspec.GridSpec(6, 6)
+        self.ax1 = plt.subplot(gs[2:6, :4])
+        self.ax2 = plt.subplot(gs[2:6, 4:6], sharey=self.ax1)
+        plt.setp(self.ax2.get_yticklabels(), visible=False)
+        self.ax3 = plt.subplot(gs[:2, :4])
+        plt.setp(self.ax3.get_xticklabels(), visible=False)
+
+    def plot(self, df, color='darkblue', alpha=0.8, markersize=0.5, yr_bin=0.1, hr_bin=0.5):
+        plot_todo_vs_year(df, self.ax1, color=color, s=markersize)
+        plot_number_perdhour_per_year(df, self.ax2, dt=hr_bin, color=color, alpha=alpha, orientation='horizontal')
+        self.ax2.set_xlabel('Average emails per hour')
+        plot_number_perday_per_year(df, self.ax3, dt=yr_bin, color=color, alpha=alpha)
+        self.ax3.set_ylabel('Average emails per day')
+
+# STEP 9: Plot the graphs
+
+plt.figure(figsize=(12,12))
+tpl = TriplePlot()
+tpl.plot(received, color='C0', alpha=0.5)
+if not sent.empty:
+    tpl.plot(sent, color='C1', alpha=0.5)
+    p2 = mpatches.Patch(color='C1', label='Outgoing', alpha=0.5)
+    plt.legend(handles=[mpatches.Patch(color='C0', label='Incoming', alpha=0.5), p2], bbox_to_anchor=[1.45, 0.7], fontsize=14, shadow=True)
+else:
+    plt.legend(handles=[mpatches.Patch(color='C0', label='Incoming', alpha=0.5)], bbox_to_anchor=[1.45, 0.7], fontsize=14, shadow=True)
+
+# Plot day of week counts bar
+counts = dfs['dayofweek'].value_counts(sort=False)
+counts.plot(kind='bar')
+plt.title('Email Count by Day of Week')
+plt.show()
+
+# Plot top senders from received
+addrs = received['from'].value_counts()
+top_addrs = addrs.head(4)
+
+plt.figure(figsize=(12,12))
+tpl = TriplePlot()
+labels = []
+colors = ['C{}'.format(ii) for ii in range(9)]
+idx = np.array([0,1,2,3])
+for ct, addr in enumerate(top_addrs.index):
+    tpl.plot(dfs[dfs['from'] == addr], color=colors[ct], alpha=0.3, yr_bin=0.5, markersize=1.0)
+    labels.append(mpatches.Patch(color=colors[ct], label=addr, alpha=0.5))
+plt.legend(handles=labels, bbox_to_anchor=[1.4, 0.9], fontsize=12, shadow=True)
+plt.show()
+
+# Plot email fraction by day of week for sent and received
+sdw = sent.groupby('dayofweek').size() / len(sent)
+rdw = received.groupby('dayofweek').size() / len(received)
+df_tmp = pd.DataFrame(data={'Outgoing Email': sdw, 'Incoming Email': rdw})
+df_tmp.plot(kind='bar', rot=45, figsize=(8,5), alpha=0.5)
+plt.xlabel('')
+plt.ylabel('Fraction of weekly emails')
+plt.grid(ls=':', color='k', alpha=0.5)
+plt.title('Fraction of Emails by Day of Week')
+plt.show()
+
+# Plot emails per hour per day of week
+plt.figure(figsize=(8,5))
+ax = plt.subplot(111)
+for ct, dow in enumerate(dfs['dayofweek'].cat.categories):
+    df_r = received[received['dayofweek'] == dow]
+    if not df_r.empty:
+        weights = np.ones(len(df_r)) / len(received)
+        wfun = lambda x: weights
+        plot_number_perdhour_per_year(df_r, ax, dt=1, smooth=True, color=f'C{ct}', alpha=0.8, lw=3, label=dow, weight_fun=wfun)
+
+    df_s = sent[sent['dayofweek'] == dow]
+    if not df_s.empty:
+        weights = np.ones(len(df_s)) / len(sent)
+        wfun = lambda x: weights
+        plot_number_perdhour_per_year(df_s, ax, dt=1, smooth=True, color=f'C{ct}', alpha=0.8, lw=2, label=dow, ls='--', weight_fun=wfun)
+ax.set_ylabel('Fraction of weekly emails per hour')
+plt.legend(loc='upper left')
+plt.title('Emails per Hour by Day of Week')
+plt.show()
+
+# Word cloud of sent email subjects (excluding arXiv no-replys)
+df_no_arxiv = dfs[dfs['from'] != 'no-reply@arXiv.org']
+text = ' '.join(map(str, sent['subject'].values))
+
+stopwords = ['free', 'win', 'offer']  # lowercase to match earlier
+
+wrd = WordCloud(width=700, height=480, margin=0, collocations=False)
+for sw in stopwords:
+    wrd.stopwords.add(sw)
+
+if text:
+    wordcloud = wrd.generate(text)
+    plt.figure(figsize=(25,15))
+    plt.imshow(wordcloud, interpolation='bilinear')
+    plt.axis("off")
+    plt.margins(x=0, y=0)
+    plt.title('Word Cloud of Sent Email Subjects (excluding common stopwords)')
+    plt.show()
+else:
+    print("No sent email subjects available for word cloud.")
+
+# --------------------------------------------
+# STEP 10: Spam classification with MLP neural network
+# --------------------------------------------
+
+# Prepare first 50 emails from received and sent for classification
+received_50 = received.head(50).copy()
+sent_50 = sent.head(50).copy()
+
+# Combine subject and content if available (assuming no 'content' column, use subject only)
+def combine_text_spam(row):
+    return str(row['subject']).lower()
+
+received_50['text'] = received_50.apply(combine_text_spam, axis=1)
+sent_50['text'] = sent_50.apply(combine_text_spam, axis=1)
+
+# Define spam keywords lowercase
+spam_keywords = ['free', 'win', 'offer']
+
+# Label spam based on presence of any keyword
+def label_spam(text):
+    return int(any(keyword in text for keyword in spam_keywords))
+
+received_50['spam'] = received_50['text'].apply(label_spam)
+sent_50['spam'] = sent_50['text'].apply(label_spam)
+
+# Combine datasets
+df_spam = pd.concat([received_50, sent_50], ignore_index=True)
+
+# Text vectorization for MLP input
+max_features = 1000
+sequence_length = 100
+vectorizer = tf.keras.layers.TextVectorization(
+    max_tokens=max_features,
+    output_mode='int',
+    output_sequence_length=sequence_length
+)
+vectorizer.adapt(df_spam['text'])
+
+X_spam = vectorizer(df_spam['text'])
+y_spam = df_spam['spam'].values
+
+# Define MLP model: 1 hidden layer, 3 neurons
+model = Sequential([
+    Input(shape=(sequence_length,)),
+    Dense(3, activation='relu'),
+    Dense(1, activation='sigmoid')
+])
+
+model.compile(
+    loss='binary_crossentropy',
+    optimizer='adam',
+    metrics=['accuracy']
+)
+
+# Train the model
+model.fit(X_spam, y_spam, epochs=10, batch_size=8, validation_split=0.2)
+
+# Evaluate final accuracy
+loss, accuracy = model.evaluate(X_spam, y_spam, verbose=0)
+print(f"\nFinal MLP model accuracy on first 50 emails from each mailbox: {accuracy:.2f}")
